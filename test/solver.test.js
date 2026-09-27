@@ -788,4 +788,199 @@ const R = (opts) => ({ replan: opts });
   assert.ok(elapsed < 1000, `带诊断的求解耗时 ${elapsed}ms，超过预期`);
 }
 
+/* ================= 备选节目单（alternatives）================= */
+
+/* 47. 未请求备选时响应保持原样：不含 alternatives 字段；alternatives:1 同样不生成 */
+{
+  const scenes = [S('A', ['x']), S('B', ['y'])];
+  const plain = solve(scenes, C());
+  assert.strictEqual(plain.ok, true);
+  assert.strictEqual('alternatives' in plain, false);
+
+  const one = solve(scenes, C(), { alternatives: 1 });
+  assert.strictEqual(one.ok, true);
+  assert.strictEqual('alternatives' in one, false);
+
+  const timedPlain = solve([T('A', [], 5, true, 0)], C(), timed(10));
+  assert.strictEqual('alternatives' in timedPlain, false);
+}
+
+/* 48. 经典模式备选：按道具操作总数升序，顺序互不相同，首条与单解同为最优 */
+{
+  const scenes = [
+    S('A', ['桌', '椅']),
+    S('B', ['桌', '椅', '灯']),
+    S('C', ['树']),
+  ];
+  const single = solve(scenes, C());
+  const r = solve(scenes, C(), { alternatives: 3 });
+  assert.strictEqual(r.ok, true);
+  assert.ok(Array.isArray(r.alternatives));
+  assert.strictEqual(r.alternatives.length, 3);
+  // 全部 6 种顺序的代价：CAB=5, CBA=6, ABC=7, BAC=7, ACB=9, BCA=10
+  assert.deepStrictEqual(r.alternatives.map(a => a.order), [
+    ['C', 'A', 'B'],
+    ['C', 'B', 'A'],
+    ['A', 'B', 'C'], // 与 BAC 同为 7，按场景录入顺序字典序在前
+  ]);
+  assert.deepStrictEqual(r.alternatives.map(a => a.totalCost), [5, 6, 7]);
+  assert.deepStrictEqual(r.alternatives.map(a => a.rank), [1, 2, 3]);
+  // 首条与单条结果同为最优
+  assert.strictEqual(r.alternatives[0].totalCost, single.totalCost);
+  // 每条备选的换景明细账目一致
+  for (const a of r.alternatives) {
+    assert.strictEqual(a.steps.reduce((acc, s) => acc + s.count, 0), a.totalCost);
+    assert.strictEqual(a.ok, true);
+  }
+}
+
+/* 49. 经典完全同分：按场景录入顺序（下标字典序）稳定排列 */
+{
+  const scenes = [S('A', []), S('B', []), S('C', [])];
+  const r = solve(scenes, C(), { alternatives: 3 });
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(r.alternatives.map(a => a.order), [
+    ['A', 'B', 'C'],
+    ['A', 'C', 'B'],
+    ['B', 'A', 'C'],
+  ]);
+  assert.ok(r.alternatives.every(a => a.totalCost === 0));
+}
+
+/* 50. 关键回归：次优编排与最优编排经过同一中间状态但前缀不同，
+   状态只留一条路径会漏掉它。可行顺序仅 [A,B,C,D] 与 [B,A,C,D]，
+   二者在状态 ({A,B,C},C) 上各有一条前缀（[A,B,C] 与 [B,A,C]）。 */
+{
+  const scenes = [
+    S('A', ['a']),
+    S('B', ['b']),
+    S('C', ['b', 'c']),
+    S('D', ['c']),
+  ];
+  const cons = C({
+    dependencies: [
+      { before: 'A', after: 'C' },
+      { before: 'B', after: 'C' },
+      { before: 'C', after: 'D' },
+    ],
+  });
+  const r = solve(scenes, cons, { alternatives: 3 });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.alternatives.length, 2); // 只有 2 条可行编排
+  // ABCD：1+2+1+1=5；BACD：1+2+3+1=7（BAC 前缀更差，单路径 DP 会丢失它）
+  assert.deepStrictEqual(r.alternatives[0].order, ['A', 'B', 'C', 'D']);
+  assert.strictEqual(r.alternatives[0].totalCost, 5);
+  assert.deepStrictEqual(r.alternatives[1].order, ['B', 'A', 'C', 'D']);
+  assert.strictEqual(r.alternatives[1].totalCost, 7);
+}
+
+/* 51. timed 备选：先价值降序、再代价升序；同子集同分按录入顺序；可含不同子集 */
+{
+  const scenes = [
+    T('A', ['x'], 10, true, 0),
+    T('B', ['x'], 10, false, 5),
+    T('C', ['y'], 10, false, 8),
+  ];
+  const r = solve(scenes, C(), { ...timed(20), alternatives: 3 });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.alternatives.length, 3);
+  // 候选：AC(v8,c3) 两种顺序 → AB(v5,c1) 两种顺序 → A(v0,c1)
+  assert.deepStrictEqual(r.alternatives[0].order, ['A', 'C']);
+  assert.strictEqual(r.alternatives[0].totalValue, 8);
+  assert.strictEqual(r.alternatives[0].totalCost, 3);
+  assert.deepStrictEqual(r.alternatives[1].order, ['C', 'A']); // 同分按录入顺序居后
+  assert.strictEqual(r.alternatives[1].totalValue, 8);
+  assert.deepStrictEqual(r.alternatives[2].order, ['A', 'B']); // 价值 5 排在价值 8 之后
+  assert.strictEqual(r.alternatives[2].totalValue, 5);
+  assert.strictEqual(r.alternatives[2].totalCost, 1);
+  // 每条都带完整的 timed 字段
+  for (const a of r.alternatives) {
+    assert.strictEqual(a.mode, 'timed');
+    assert.strictEqual(a.timeLimit, 20);
+    assert.strictEqual(a.usedDuration, 20);
+    assert.strictEqual(a.remainingDuration, 0);
+    assert.deepStrictEqual(a.selectedIds, a.order);
+    assert.strictEqual(a.steps.reduce((acc, s) => acc + s.count, 0), a.totalCost);
+  }
+}
+
+/* 52. timed 备选：无必演时空节目单参与排名（价值 0、代价 0） */
+{
+  const scenes = [T('A', ['x', 'y'], 10, false, 0)]; // 价值 0，入选不赚
+  const r = solve(scenes, C(), { ...timed(10), alternatives: 2 });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.alternatives.length, 2);
+  assert.deepStrictEqual(r.alternatives[0].order, []); // 空节目单代价 0 居首
+  assert.strictEqual(r.alternatives[0].totalValue, 0);
+  assert.strictEqual(r.alternatives[0].totalCost, 0);
+  assert.deepStrictEqual(r.alternatives[0].excludedIds, ['A']);
+  assert.deepStrictEqual(r.alternatives[1].order, ['A']);
+}
+
+/* 53. 备选同样满足单段上限：上限收紧后备选随之变化，且每段都不超限 */
+{
+  const scenes = [
+    S('s0', ['p2', 'p4', 'p6']),
+    S('s1', ['p5', 'p1', 'p6']),
+    S('s2', ['p4']),
+    S('s3', ['p5', 'p3']),
+  ];
+  const capped = solve(scenes, C(), { opLimit: 3, alternatives: 3 });
+  assert.strictEqual(capped.ok, true);
+  // 上限 3 下仅 2 条可行编排（s0↔s2、s1↔s3、s2↔s3 之外的长段都被禁）
+  assert.strictEqual(capped.alternatives.length, 2);
+  assert.deepStrictEqual(capped.alternatives.map(a => a.order), [
+    ['s0', 's2', 's3', 's1'],
+    ['s1', 's3', 's2', 's0'],
+  ]);
+  assert.deepStrictEqual(capped.alternatives.map(a => a.totalCost), [11, 11]);
+  for (const a of capped.alternatives) {
+    for (const step of a.steps) assert.ok(step.count <= 3);
+  }
+  // 上限导致无解时：返回冲突，不挂 alternatives
+  const nope = solve(scenes, C(), { opLimit: 1, alternatives: 3 });
+  assert.strictEqual(nope.ok, false);
+  assert.strictEqual(nope.conflict.type, 'prop-limit-infeasible');
+  assert.strictEqual('alternatives' in nope, false);
+}
+
+/* 54. 无解（约束冲突）时不生成备选；请求数量超过 3 按 3 计 */
+{
+  const cyc = solve([S('A', []), S('B', [])], C({
+    dependencies: [{ before: 'A', after: 'B' }, { before: 'B', after: 'A' }],
+  }), { alternatives: 3 });
+  assert.strictEqual(cyc.ok, false);
+  assert.strictEqual('alternatives' in cyc, false);
+
+  const many = solve([S('A', []), S('B', []), S('C', [])], C(), { alternatives: 99 });
+  assert.strictEqual(many.ok, true);
+  assert.strictEqual(many.alternatives.length, 3); // 最多 3 条
+}
+
+/* 55. 12 场景带备选性能冒烟（经典与 timed，应远小于 1 秒） */
+{
+  const scenes = [];
+  for (let i = 0; i < 12; i++) scenes.push(S(`S${i}`, [`p${i}`, `p${i + 1}`]));
+  const cons = C({
+    dependencies: [{ before: 'S0', after: 'S11' }],
+    fixedPositions: [{ sceneId: 'S5', position: 6 }],
+    forbiddenAdjacencies: [{ a: 'S1', b: 'S2' }],
+  });
+  const t0 = Date.now();
+  const r = solve(scenes, cons, { alternatives: 3 });
+  const elapsed = Date.now() - t0;
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.alternatives.length, 3);
+  assert.ok(elapsed < 1000, `经典带备选求解耗时 ${elapsed}ms，超过预期`);
+
+  const tScenes = [];
+  for (let i = 0; i < 12; i++) tScenes.push(T(`S${i}`, [`p${i}`, `p${i + 1}`], 5, i < 3, i));
+  const t1 = Date.now();
+  const rt = solve(tScenes, cons, { mode: 'timed', timeLimit: 60, alternatives: 3 });
+  const elapsedT = Date.now() - t1;
+  assert.strictEqual(rt.ok, true);
+  assert.strictEqual(rt.alternatives.length, 3);
+  assert.ok(elapsedT < 1000, `timed 带备选求解耗时 ${elapsedT}ms，超过预期`);
+}
+
 console.log('全部测试通过 ✔');

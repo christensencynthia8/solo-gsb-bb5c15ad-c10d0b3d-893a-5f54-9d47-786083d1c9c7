@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>🎭 舞台换景顺序优化</h1>
-    <p>录入场景与道具，设置约束，计算道具增减次数最少的演出顺序（最多 12 个场景）。演出进行中还可确认已完成前缀、录入舞台实况，只重排剩余场景。</p>
+    <p>录入场景与道具，设置约束，计算道具增减次数最少的演出顺序（最多 12 个场景），还可生成最多 3 条备选节目单比较取舍。演出进行中可确认已完成前缀、录入舞台实况，只重排剩余场景。</p>
   </header>
 
   <main>
@@ -110,10 +110,17 @@
       </div>
       <div class="toolbar">
         <button id="btn-solve" class="btn btn-primary">▶ 计算最优顺序</button>
+        <label class="alt-count-label" for="alt-count">备选节目单：</label>
+        <select id="alt-count">
+          <option value="1" selected>不生成（仅最优解）</option>
+          <option value="2">生成 2 条候选</option>
+          <option value="3">生成 3 条候选</option>
+        </select>
         <input type="text" id="plan-name" placeholder="方案名称">
         <button id="btn-save" class="btn">💾 保存方案</button>
         <button id="btn-new" class="btn btn-ghost">新建方案</button>
       </div>
+      <p class="hint" id="alt-count-hint">生成多条顺序不同的可行编排：经典模式按道具操作总数升序，时长受限模式先按可选价值降序再按操作总数升序；可比较各方案取舍后采用其一进入演出中重排。</p>
       <div class="toolbar">
         <select id="plan-select"><option value="">— 选择已保存的方案 —</option></select>
         <button id="btn-load" class="btn">载入编辑</button>

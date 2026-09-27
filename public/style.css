@@ -371,3 +371,74 @@ input[type="number"] { width: 70px; }
 .phase-suffix { background: #4a3a6b; color: #d9c9f5; border: 1px solid var(--accent-2); }
 .step-done { opacity: 0.62; }
 .step-done .step-title { text-decoration: line-through; text-decoration-color: rgba(255,255,255,0.35); }
+
+/* ================= 备选节目单 ================= */
+.alt-count-label { font-size: 14px; color: var(--muted); }
+#alt-count { min-width: 160px; }
+#alt-count-hint { margin: 6px 0 0; }
+
+.alt-panel {
+  border: 1px solid var(--accent-2);
+  background: rgba(124, 92, 191, 0.07);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 16px 0;
+}
+.alt-panel > h3 { margin: 0 0 6px; }
+
+.alt-card {
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-top: 12px;
+}
+.alt-card.alt-current { border-color: var(--ok); }
+
+.alt-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.alt-rank {
+  display: inline-block;
+  background: var(--accent-2);
+  border-radius: 6px;
+  padding: 2px 10px;
+  font-weight: bold;
+}
+.alt-current .alt-rank { background: #3a5a45; border: 1px solid var(--ok); }
+.alt-tag {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: bold;
+  border-radius: 4px;
+  padding: 1px 8px;
+  border: 1px solid;
+}
+.alt-tag-best { color: var(--accent); border-color: var(--accent); background: rgba(232,182,76,0.12); }
+.alt-tag-current { color: #9fe0bb; border-color: var(--ok); background: rgba(76,175,125,0.12); }
+.alt-metrics { font-size: 14px; color: var(--text); }
+.alt-metrics strong { color: var(--accent); font-size: 16px; margin: 0 1px; }
+.alt-adopt { margin-left: auto; }
+
+.alt-tradeoff {
+  margin: 8px 0 4px;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+.alt-excluded {
+  margin: 4px 0 8px;
+  font-size: 13.5px;
+  color: #ffb3b0;
+}
+.alt-card .order-flow { margin: 8px 0 10px; }
+.alt-card details { margin-top: 6px; }
+.alt-card summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13.5px;
+  user-select: none;
+}
+.alt-card summary:hover { color: var(--accent); }

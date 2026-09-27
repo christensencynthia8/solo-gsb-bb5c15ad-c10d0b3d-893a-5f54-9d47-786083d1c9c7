@@ -20,6 +20,16 @@
  *    求解器在同时满足现有约束与该上限的候选中，仍按上述原目标择优；
  *    重排时上限只约束后缀（含"从当前实际道具切入"的首段），已完成前缀不变。
  *
+ * 可选参数 alternatives（备选节目单数量，1~3；缺省/1 表示不生成备选）：
+ *    请求 N ≥ 2 时，响应额外携带 alternatives 数组，给出最多 N 条顺序不同
+ *    的可行编排。排序：经典模式按道具操作总数升序；时长受限模式先按可选
+ *    场景价值降序、再按操作总数升序；完全同分按场景录入顺序（下标字典序）
+ *    稳定排列。每条备选都满足依赖 / 固定序位 / 禁止相邻 / 时长 / 单段上限。
+ *    实现上每个 DP 状态 (mask, last) 保留至多 K 条最优路径而非一条——
+ *    次优编排可能与最优编排经过同一中间状态但前缀不同，只留一条会漏掉
+ *    后续候选；由于可行后缀及其代价只取决于状态本身，每状态留前 K 条
+ *    即可保证全局前 K 条不重不漏。
+ *
  * 约束类型：
  *  - dependencies:        [{ before, after }]   before 必须排在 after 之前（二者都入选时生效）
  *  - fixedPositions:      [{ sceneId, position }] 场景固定在第 position 位（1 起，按入选序列计）
@@ -59,6 +69,14 @@ function normOpLimit(v) {
   if (v === null || v === undefined || v === '') return Infinity;
   const n = Number(v);
   return (Number.isFinite(n) && Number.isInteger(n) && n >= 0) ? n : Infinity;
+}
+
+/** 备选节目单数量：2~3 表示生成对应条数的备选；其余（缺省/1/非法）表示不生成。 */
+const MAX_ALTERNATIVES = 3;
+function normAltCount(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 2) return 1;
+  return Math.min(MAX_ALTERNATIVES, n);
 }
 
 /** 把输入编译成位掩码/矩阵模型，供 DP 使用。 */
@@ -347,6 +365,221 @@ function runTimedDP(model, timeLimit, opLimit = Infinity) {
   }
   orderIdx.reverse();
   return { cost: best.cost, orderIdx, value: best.value, usedDuration: best.usedDuration, mask: best.mask };
+}
+
+/**
+ * ============================================================
+ * 备选节目单（top-K 可行编排，K ≤ 3）
+ * ============================================================
+ *
+ * 与单解 DP 的唯一区别：每个状态 (mask, last) 保留至多 K 条最优路径，
+ * 而不是只留一条。次优完整编排可能与最优编排经过同一中间状态但前缀不同
+ * （例如 [A,B,C,D] 与 [B,A,C,D] 在状态 ({A,B,C}, C) 上各有一条前缀），
+ * 只留一条最优路径就会漏掉这些后续候选。
+ *
+ * 正确性：从状态 (mask, last) 出发的"可行后缀集合与其代价"只取决于状态
+ * 本身（依赖看 mask、固定序位看 popcount、禁邻与换景边看 last），与前缀
+ * 无关。因此若某条完整编排属于全局前 K，则它的每个前缀必属于对应状态的
+ * 前 K（否则存在 K 条更优前缀接同一后缀，产生 K 条更优的完整编排，矛盾）。
+ * 每状态保留前 K 条即可保证全局前 K 条不重不漏。
+ *
+ * 排序键：代价升序；同代价按场景下标字典序（即按场景录入顺序稳定）。
+ * timed 模式在终态汇总时再按"价值降序 → 代价升序 → 下标字典序"取前 K。
+ */
+
+/** 候选比较：代价升序；同代价按场景下标字典序（= 按场景录入顺序稳定）。 */
+function cmpCand(a, b) {
+  if (a.cost !== b.cost) return a.cost - b.cost;
+  const sa = a.seq, sb = b.seq;
+  const len = Math.min(sa.length, sb.length);
+  for (let i = 0; i < len; i++) {
+    if (sa[i] !== sb[i]) return sa[i] - sb[i];
+  }
+  return sa.length - sb.length;
+}
+
+/** 向按 cmpCand 升序的列表插入候选，只保留前 K 条。 */
+function insertTopK(list, cand, K) {
+  let lo = 0, hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cmpCand(list[mid], cand) < 0) lo = mid + 1; else hi = mid;
+  }
+  if (lo >= K) return;
+  list.splice(lo, 0, cand);
+  if (list.length > K) list.pop();
+}
+
+/**
+ * 经典模式 top-K：全部场景参演，返回按"总代价升序 → 下标字典序"的前 K 条编排。
+ * 状态、转移与受限边同 runDP；返回 [{ cost, orderIdx }]，无解时返回空数组。
+ */
+function runDPK(model, opLimit, K) {
+  const { n, prereq, fixedPosOfScene, sceneAtPos, bad, cost, setupCost } = model;
+  const fullMask = (1 << n) - 1;
+  const dp = new Array(1 << n); // dp[mask][last] = [{ cost, seq }]（至多 K 条，升序）
+
+  const allowedAt = (j, pos) =>
+    (fixedPosOfScene[j] === -1 || fixedPosOfScene[j] === pos) &&
+    (sceneAtPos[pos] === -1 || sceneAtPos[pos] === j);
+
+  const ensure = (m) => { if (!dp[m]) dp[m] = new Array(n).fill(null); };
+
+  for (let j = 0; j < n; j++) {
+    if (prereq[j] !== 0) continue;
+    if (!allowedAt(j, 0)) continue;
+    if (setupCost[j] > opLimit) continue;
+    ensure(1 << j);
+    dp[1 << j][j] = [{ cost: setupCost[j], seq: [j] }];
+  }
+
+  for (let mask = 1; mask <= fullMask; mask++) {
+    const row = dp[mask];
+    if (!row) continue;
+    const pos = popcount(mask);
+    if (pos >= n) continue;
+    for (let last = 0; last < n; last++) {
+      const entries = row[last];
+      if (!entries) continue;
+      for (let j = 0; j < n; j++) {
+        const bit = 1 << j;
+        if (mask & bit) continue;
+        if ((prereq[j] & ~mask) !== 0) continue;
+        if (!allowedAt(j, pos)) continue;
+        if (bad[last][j]) continue;
+        const edge = cost[last][j];
+        if (edge > opLimit) continue;
+        const nm = mask | bit;
+        ensure(nm);
+        let list = dp[nm][j];
+        if (!list) list = dp[nm][j] = [];
+        for (const e of entries) {
+          const nc = e.cost + edge;
+          // entries 按代价升序：当前候选已劣于列表最劣者时，后续候选只会更差
+          if (list.length === K && nc > list[K - 1].cost) break;
+          insertTopK(list, { cost: nc, seq: e.seq.concat(j) }, K);
+        }
+      }
+    }
+  }
+
+  const fullRow = dp[fullMask];
+  if (!fullRow) return [];
+  const all = [];
+  for (let last = 0; last < n; last++) {
+    const entries = fullRow[last];
+    if (!entries) continue;
+    for (const e of entries) all.push(e);
+  }
+  all.sort(cmpCand);
+  return all.slice(0, K).map(e => ({ cost: e.cost, orderIdx: e.seq }));
+}
+
+/**
+ * 时长受限模式 top-K：返回按"价值降序 → 总代价升序 → 下标字典序"的前 K 条编排。
+ * 可行性刻画与 runTimedDP 相同（末尾无后继、固定序位按入选序列计），
+ * 每个 (mask, last) 保留至多 K 条路径，最后在所有"含全部必演且不超时"的
+ * 终态上汇总取前 K；无必演项时空节目单（价值 0、代价 0）同样参与排名。
+ * 返回 [{ cost, orderIdx, value, usedDuration, mask }]，无解时返回空数组。
+ */
+function runTimedDPK(model, timeLimit, opLimit, K) {
+  const { n, prereq, fixedMask, bad, cost, setupCost, durations, values, requiredMask } = model;
+  const fullMask = (1 << n) - 1;
+
+  const fixedAt = (j, p) => {
+    const fm = fixedMask[j];
+    return fm === 0 || fm === (1 << p);
+  };
+
+  // succMask[a]：必须排在 a 之后的场景集合
+  const succMask = new Array(n).fill(0);
+  for (let b = 0; b < n; b++) {
+    let m = prereq[b];
+    while (m) {
+      const bit = m & -m;
+      const a = 31 - Math.clz32(bit);
+      succMask[a] |= (1 << b);
+      m ^= bit;
+    }
+  }
+
+  const durSum = new Float64Array(1 << n);
+  const valSum = new Float64Array(1 << n);
+  for (let m = 1; m <= fullMask; m++) {
+    const bit = m & -m;
+    const i = 31 - Math.clz32(bit);
+    const pm = m ^ bit;
+    durSum[m] = durSum[pm] + durations[i];
+    valSum[m] = valSum[pm] + values[i];
+  }
+
+  const dp = new Array(1 << n);
+  const ensure = (m) => { if (!dp[m]) dp[m] = new Array(n).fill(null); };
+
+  for (let j = 0; j < n; j++) {
+    if (!fixedAt(j, 0)) continue;
+    if (setupCost[j] > opLimit) continue;
+    ensure(1 << j);
+    dp[1 << j][j] = [{ cost: setupCost[j], seq: [j] }];
+  }
+
+  for (let mask = 1; mask <= fullMask; mask++) {
+    const row = dp[mask];
+    if (!row) continue;
+    const posAfter = popcount(mask);
+    for (let last = 0; last < n; last++) {
+      const bit = 1 << last;
+      if (mask & bit) continue;
+      const nm = mask | bit;
+      if (!fixedAt(last, posAfter)) continue;
+      if (succMask[last] & mask) continue;
+      ensure(nm);
+      for (let prev = 0; prev < n; prev++) {
+        const entries = row[prev];
+        if (!entries) continue;
+        if (bad[prev][last]) continue;
+        const edge = cost[prev][last];
+        if (edge > opLimit) continue;
+        let list = dp[nm][last];
+        if (!list) list = dp[nm][last] = [];
+        for (const e of entries) {
+          const nc = e.cost + edge;
+          if (list.length === K && nc > list[K - 1].cost) break;
+          insertTopK(list, { cost: nc, seq: e.seq.concat(last) }, K);
+        }
+      }
+    }
+  }
+
+  // 无必演项时，空节目单（价值 0、代价 0）作为候选参与排名
+  const cands = [];
+  if (requiredMask === 0) {
+    cands.push({ cost: 0, seq: [], value: 0, usedDuration: 0, mask: 0 });
+  }
+  for (let mask = 0; mask <= fullMask; mask++) {
+    if ((mask & requiredMask) !== requiredMask) continue;
+    if (durSum[mask] > timeLimit) continue;
+    const row = dp[mask];
+    if (!row) continue;
+    for (let last = 0; last < n; last++) {
+      const entries = row[last];
+      if (!entries) continue;
+      for (const e of entries) {
+        cands.push({ cost: e.cost, seq: e.seq, value: valSum[mask], usedDuration: durSum[mask], mask });
+      }
+    }
+  }
+  cands.sort((a, b) => {
+    if (a.value !== b.value) return b.value - a.value; // 价值降序优先
+    return cmpCand(a, b);
+  });
+  return cands.slice(0, K).map(c => ({
+    cost: c.cost,
+    orderIdx: c.seq,
+    value: c.value,
+    usedDuration: c.usedDuration,
+    mask: c.mask,
+  }));
 }
 
 /** 检测依赖环，返回构成环的依赖约束数组，无环返回 null。 */
@@ -1724,11 +1957,16 @@ function buildPropLimitConflict(opLimit, minCap, timed, suffix) {
 
 /**
  * 求解入口。
- * @param {object} options { mode?: 'classic'|'timed', timeLimit?: number, opLimit?: number }
+ * @param {object} options { mode?: 'classic'|'timed', timeLimit?: number, opLimit?: number,
+ *                           alternatives?: number }
  *   opLimit 为可选的单段道具操作上限（正整数；缺省表示不限）
- * @returns 经典有解：{ ok:true, order, totalCost, opLimit, steps }
+ *   alternatives 为可选的备选节目单数量（2~3；缺省/1 表示不生成备选，
+ *   响应保持原有单条结果，不含 alternatives 字段）
+ * @returns 经典有解：{ ok:true, order, totalCost, opLimit, steps, alternatives? }
  *          时长受限有解：{ ok:true, mode:'timed', order, selectedIds, excludedIds,
- *                          totalCost, totalValue, usedDuration, remainingDuration, timeLimit, opLimit, steps }
+ *                          totalCost, totalValue, usedDuration, remainingDuration, timeLimit,
+ *                          opLimit, steps, alternatives? }
+ *          alternatives 每项是与单条结果同形的完整编排（额外带 rank，从 1 起按优劣排列）
  *          无解：{ ok:false, conflict }（时长超限额外带 reason:'required-overtime'；
  *                上限导致无解时 conflict.type 为 'prop-limit-infeasible' 并带 minRequiredLimit）
  */
@@ -1736,6 +1974,7 @@ function solve(scenes, constraints, options = {}) {
   const model = buildModel(scenes, constraints);
   const opLimit = normOpLimit(options.opLimit);
   const opLimitOut = opLimit === Infinity ? null : opLimit;
+  const altK = normAltCount(options.alternatives);
 
   if (options.mode !== 'timed') {
     const res = runDP(model, opLimit);
@@ -1746,13 +1985,24 @@ function solve(scenes, constraints, options = {}) {
       }
       return { ok: false, conflict: analyzeConflict(scenes, constraints || {}) };
     }
-    return {
+    const out = {
       ok: true,
       order: res.orderIdx.map(i => scenes[i].id),
       totalCost: res.cost,
       opLimit: opLimitOut,
       steps: buildSteps(model, scenes, res.orderIdx),
     };
+    if (altK > 1) {
+      out.alternatives = runDPK(model, opLimit, altK).map((a, i) => ({
+        rank: i + 1,
+        ok: true,
+        order: a.orderIdx.map(g => scenes[g].id),
+        totalCost: a.cost,
+        opLimit: opLimitOut,
+        steps: buildSteps(model, scenes, a.orderIdx),
+      }));
+    }
+    return out;
   }
 
   const timeLimit = Number(options.timeLimit) || 0;
@@ -1789,7 +2039,7 @@ function solve(scenes, constraints, options = {}) {
   const selectedSet = new Set(selectedIds);
   const excludedIds = scenes.map(s => s.id).filter(id => !selectedSet.has(id));
 
-  return {
+  const out = {
     ok: true,
     mode: 'timed',
     order: selectedIds,
@@ -1803,6 +2053,28 @@ function solve(scenes, constraints, options = {}) {
     opLimit: opLimitOut,
     steps: buildSteps(model, scenes, res.orderIdx),
   };
+  if (altK > 1) {
+    out.alternatives = runTimedDPK(model, timeLimit, opLimit, altK).map((a, i) => {
+      const sel = a.orderIdx.map(g => scenes[g].id);
+      const selSet = new Set(sel);
+      return {
+        rank: i + 1,
+        ok: true,
+        mode: 'timed',
+        order: sel,
+        selectedIds: sel,
+        excludedIds: scenes.map(s => s.id).filter(id => !selSet.has(id)),
+        totalCost: a.cost,
+        totalValue: a.value,
+        usedDuration: a.usedDuration,
+        remainingDuration: timeLimit - a.usedDuration,
+        timeLimit,
+        opLimit: opLimitOut,
+        steps: buildSteps(model, scenes, a.orderIdx),
+      };
+    });
+  }
+  return out;
 }
 
-module.exports = { solve, replan, MAX_SCENES, normalizeProps };
+module.exports = { solve, replan, MAX_SCENES, MAX_ALTERNATIVES, normalizeProps };

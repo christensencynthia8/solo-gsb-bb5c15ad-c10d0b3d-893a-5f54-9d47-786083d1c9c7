@@ -13,6 +13,7 @@ const state = {
   scenes: [], // classic: { id, name, props }；timed 额外带 { duration, required, value }
   constraints: { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] },
   live: null, // 最近一次求解/重排结果（当前节目单）
+  alternatives: null, // 最近一次求解返回的备选节目单（未请求时为 null）
   replan: null, // 演出中重排会话：{ prefixIds, chainStartOrder, kDraft, stageProps }
   savedReplan: null, // 随方案保存的重排状态（载入后用于自动恢复）
 };
@@ -137,6 +138,7 @@ function renderScenes() {
       c.fixedPositions = c.fixedPositions.filter(f => f.sceneId !== s.id);
       c.forbiddenAdjacencies = c.forbiddenAdjacencies.filter(f => f.a !== s.id && f.b !== s.id);
       state.live = null;
+      state.alternatives = null;
       state.replan = null;
       renderAll();
     });
@@ -190,6 +192,7 @@ function applyMode(mode) {
   }
   $('#result-card').hidden = true;
   state.live = null;
+  state.alternatives = null;
   state.replan = null;
   syncOpLimitUI();
   renderAll();
@@ -297,13 +300,19 @@ function showStatus(msg, isError) {
 
 async function doSolve() {
   $('#result-card').hidden = true;
+  const body = payload();
+  const altCount = Number($('#alt-count').value) || 1;
+  if (altCount > 1) body.alternatives = altCount; // 请求备选节目单（最多 3 条）
   const data = await api('/api/solve', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload()),
+    body: JSON.stringify(body),
   });
   // 重新求解会取消演出中重排会话
   state.live = data.ok ? data : null;
+  state.alternatives = (data.ok && Array.isArray(data.alternatives) && data.alternatives.length)
+    ? data.alternatives
+    : null;
   state.replan = null;
   renderResult(data);
 }
@@ -324,8 +333,127 @@ function renderResult(data) {
   const isReplan = !!data.replanned;
   if (isReplan) box.appendChild(comparisonBlock(data));
   box.appendChild(data.mode === 'timed' ? timedResultBlock(data) : resultBlock(data));
+  if (state.alternatives && state.alternatives.length) {
+    box.appendChild(alternativesBlock(data));
+  }
   box.appendChild(replanPanelBlock(data));
   $('#result-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/* ================= 备选节目单 ================= */
+const sameOrder = (a, b) => Array.isArray(a) && Array.isArray(b)
+  && a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** 与最优备选相比的取舍说明（备选已按优劣排序，alts[0] 即最优）。 */
+function altTradeoffText(alt, best) {
+  const parts = [];
+  if (alt.mode === 'timed') {
+    const dv = (best.totalValue || 0) - (alt.totalValue || 0);
+    if (dv > 0) parts.push(`可选价值少 ${dv}`);
+    const dd = (alt.usedDuration || 0) - (best.usedDuration || 0);
+    if (dd !== 0) parts.push(dd < 0 ? `用时少 ${-dd} 分钟` : `用时多 ${dd} 分钟`);
+  }
+  const dc = alt.totalCost - best.totalCost;
+  if (dc > 0) parts.push(`道具操作多 ${dc} 次`);
+  return parts.length ? `相比最优：${parts.join('，')}` : '与最优方案完全同分（并列最优的不同顺序）';
+}
+
+function alternativesBlock(current) {
+  const alts = state.alternatives;
+  const best = alts[0];
+  const wrap = document.createElement('div');
+  wrap.className = 'alt-panel';
+
+  const h = document.createElement('h3');
+  h.textContent = `🗂 备选节目单（${alts.length} 条可行编排）`;
+  wrap.appendChild(h);
+
+  const intro = document.createElement('p');
+  intro.className = 'hint';
+  intro.textContent = isTimed()
+    ? '按"可选价值降序 → 道具操作升序"排列，同分按场景录入顺序；每条都满足全部约束、时长与单段上限。'
+    : '按"道具操作总数升序"排列，同分按场景录入顺序；每条都满足全部约束与单段上限。';
+  wrap.appendChild(intro);
+
+  alts.forEach((alt, i) => {
+    const isCurrent = sameOrder(alt.order, current.order);
+    const card = document.createElement('div');
+    card.className = 'alt-card' + (isCurrent ? ' alt-current' : '');
+
+    // 头部：名次、标签、指标、取舍、采用按钮
+    const head = document.createElement('div');
+    head.className = 'alt-card-head';
+    const rank = document.createElement('span');
+    rank.className = 'alt-rank';
+    rank.textContent = `#${i + 1}`;
+    head.appendChild(rank);
+    if (i === 0) {
+      const tag = document.createElement('span');
+      tag.className = 'alt-tag alt-tag-best';
+      tag.textContent = '最优';
+      head.appendChild(tag);
+    }
+    if (isCurrent) {
+      const tag = document.createElement('span');
+      tag.className = 'alt-tag alt-tag-current';
+      tag.textContent = '✓ 当前节目单';
+      head.appendChild(tag);
+    }
+    const metrics = document.createElement('span');
+    metrics.className = 'alt-metrics';
+    metrics.innerHTML = alt.mode === 'timed'
+      ? `价值 <strong>${alt.totalValue}</strong> · 时长 <strong>${alt.usedDuration}</strong>/${alt.timeLimit} 分钟 · 道具增减 <strong>${alt.totalCost}</strong> 次`
+      : `道具增减 <strong>${alt.totalCost}</strong> 次`;
+    head.appendChild(metrics);
+    const adoptBtn = document.createElement('button');
+    adoptBtn.className = 'btn btn-sm btn-primary alt-adopt';
+    adoptBtn.textContent = isCurrent ? '已采用' : '采用此顺序';
+    adoptBtn.disabled = isCurrent;
+    adoptBtn.title = isCurrent ? '当前节目单即为该顺序' : '按该顺序作为当前节目单，进入演出中重排';
+    adoptBtn.addEventListener('click', () => adoptAlternative(alt));
+    head.appendChild(adoptBtn);
+    card.appendChild(head);
+
+    const tradeoff = document.createElement('p');
+    tradeoff.className = 'alt-tradeoff';
+    tradeoff.textContent = i === 0
+      ? '当前目标下的最优编排'
+      : altTradeoffText(alt, best);
+    card.appendChild(tradeoff);
+
+    // 演出顺序
+    card.appendChild(flowBlock(alt.order, 0));
+
+    // 时长受限模式：舍弃场景也是取舍的一部分
+    if (alt.mode === 'timed') {
+      const excl = document.createElement('p');
+      excl.className = 'alt-excluded';
+      excl.textContent = alt.excludedIds.length
+        ? `舍弃场景：${alt.excludedIds.map(id => sceneName(id)).join('、')}`
+        : '舍弃场景：无（全部入选）';
+      card.appendChild(excl);
+    }
+
+    // 换景明细（默认展开，可折叠）
+    const details = document.createElement('details');
+    details.open = true;
+    const summary = document.createElement('summary');
+    summary.textContent = '换景明细';
+    details.appendChild(summary);
+    details.appendChild(stepsBlock(alt));
+    card.appendChild(details);
+
+    wrap.appendChild(card);
+  });
+  return wrap;
+}
+
+/** 采用某条备选：以其顺序作为当前节目单，可在此基础上进入演出中重排。 */
+function adoptAlternative(alt) {
+  state.live = alt;
+  state.replan = null; // 以新节目单重新开始重排会话
+  renderResult(alt);
+  showStatus(`已采用备选 #${alt.rank} 的节目单，可在下方「演出中重排」按该顺序继续`);
 }
 
 /* ================= 演出中重排 ================= */
@@ -491,6 +619,7 @@ async function doReplan(data, btn, msgEl) {
     stageProps: rp.stageProps.slice(),
   };
   state.live = res;
+  state.alternatives = null; // 重排后原备选节目单已过期
   renderResult(res);
 }
 
@@ -855,6 +984,7 @@ async function loadPlan() {
   $('#plan-name').value = data.plan.name;
   $('#result-card').hidden = true;
   state.live = null;
+  state.alternatives = null;
   state.replan = null;
   if (data.plan.replanState && Array.isArray(data.plan.replanState.prefixIds)
       && data.plan.replanState.prefixIds.length) {
@@ -891,6 +1021,7 @@ async function restoreSavedReplan() {
     return;
   }
   state.live = solveData;
+  state.alternatives = null;
   state.replan = null;
 
   // 校验保存的前缀仍是当前节目单的连续前缀；不一致则放弃自动恢复
@@ -974,6 +1105,7 @@ function newPlan() {
   state.scenes = [];
   state.constraints = { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] };
   state.live = null;
+  state.alternatives = null;
   state.replan = null;
   state.savedReplan = null;
   $('#plan-name').value = '';
