@@ -2,7 +2,7 @@
 
 const path = require('path');
 const express = require('express');
-const { solve, replan, MAX_SCENES, normalizeProps } = require('./solver');
+const { solve, replan, MAX_SCENES, MAX_ALTERNATIVES, normalizeProps } = require('./solver');
 const store = require('./store');
 
 const app = express();
@@ -42,6 +42,18 @@ function validatePayload(body) {
       errors.push('单段道具操作上限必须是正整数（件），或留空表示不限');
     } else {
       opLimit = n;
+    }
+  }
+
+  // 备选节目单条数（可选；缺省/1 表示只返回原有单条结果）
+  let alternatives = 1;
+  const rawAlt = body && body.alternatives;
+  if (rawAlt !== undefined && rawAlt !== null) {
+    const n = Number(rawAlt);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > MAX_ALTERNATIVES) {
+      errors.push(`备选节目单条数必须是 1 到 ${MAX_ALTERNATIVES} 之间的整数`);
+    } else {
+      alternatives = n;
     }
   }
 
@@ -114,6 +126,7 @@ function validatePayload(body) {
     mode,
     timeLimit,
     opLimit,
+    alternatives,
     scenes,
     constraints: { dependencies, fixedPositions, forbiddenAdjacencies },
   };
@@ -191,9 +204,9 @@ function sanitizeReplanState(raw, idSet) {
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.post('/api/solve', (req, res) => {
-  const { errors, mode, timeLimit, opLimit, scenes, constraints } = validatePayload(req.body);
+  const { errors, mode, timeLimit, opLimit, alternatives, scenes, constraints } = validatePayload(req.body);
   if (errors.length) return res.status(400).json({ ok: false, errors });
-  res.json(solve(scenes, constraints, { mode, timeLimit, opLimit }));
+  res.json(solve(scenes, constraints, { mode, timeLimit, opLimit, alternatives }));
 });
 
 /** 演出中重排：确认已完成连续前缀 + 当前舞台实际道具，只重排剩余场景 */

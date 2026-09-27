@@ -10,6 +10,7 @@ const state = {
   mode: 'classic', // 'classic' | 'timed'
   timeLimit: 120,
   opLimit: null, // 单段道具操作上限（件）；null 表示不限
+  alternatives: 1, // 一次请求的备选节目单条数（1..3）；1 表示只要原有单条结果
   scenes: [], // classic: { id, name, props }；timed 额外带 { duration, required, value }
   constraints: { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] },
   live: null, // 最近一次求解/重排结果（当前节目单）
@@ -281,6 +282,7 @@ function payload() {
   };
   if (isTimed()) base.timeLimit = state.timeLimit;
   if (state.opLimit !== null) base.opLimit = state.opLimit;
+  if (state.alternatives > 1) base.alternatives = state.alternatives;
   return base;
 }
 
@@ -323,7 +325,13 @@ function renderResult(data) {
   }
   const isReplan = !!data.replanned;
   if (isReplan) box.appendChild(comparisonBlock(data));
+  if (data.alternatives && data.alternatives.length > 1) {
+    box.appendChild(alternativesOverviewBlock(data));
+  }
   box.appendChild(data.mode === 'timed' ? timedResultBlock(data) : resultBlock(data));
+  if (data.alternatives && data.alternatives.length > 1) {
+    box.appendChild(alternativesListBlock(data));
+  }
   box.appendChild(replanPanelBlock(data));
   $('#result-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
@@ -740,6 +748,7 @@ function stepsBlock(data) {
 
 function resultBlock(data) {
   const frag = document.createDocumentFragment();
+  if (data.alternatives && data.alternatives.length > 1) frag.appendChild(primaryPlanBadge(data.alternatives.length));
   const prefixLen = data.replanned ? (data.prefixIds || []).length : 0;
   frag.appendChild(flowBlock(data.order, prefixLen));
   frag.appendChild(stepsBlock(data));
@@ -780,6 +789,8 @@ function sceneListBlock(title, ids, cls) {
 function timedResultBlock(data) {
   const frag = document.createDocumentFragment();
 
+  if (data.alternatives && data.alternatives.length > 1) frag.appendChild(primaryPlanBadge(data.alternatives.length));
+
   const summary = document.createElement('div');
   summary.className = 'timed-summary';
   let html =
@@ -800,6 +811,163 @@ function timedResultBlock(data) {
   frag.appendChild(sceneListBlock(`舍弃场景（${data.excludedIds.length} 个，不参与约束）`, data.excludedIds, 'pick-out'));
   frag.appendChild(stepsBlock(data));
   return frag;
+}
+
+/* ================= 备选节目单 ================= */
+
+/** 主结果区（方案 1）的标记。 */
+function primaryPlanBadge(total) {
+  const div = document.createElement('div');
+  div.className = 'alt-primary-badge';
+  div.innerHTML = `方案 1 / ${total}　<strong>★ 最优方案（当前节目单）</strong>`;
+  return div;
+}
+
+/** 取舍徽标：与第 1 条（最优）方案相比，代价 / 价值的增减。 */
+function tradeoffSpans(base, alt, isTimedMode) {
+  const spans = [];
+  const dCost = alt.totalCost - base.totalCost;
+  if (dCost === 0) {
+    spans.push('<span class="delta-flat">道具操作与最优相同</span>');
+  } else {
+    spans.push(`<span class="delta-up">道具操作多 ${dCost} 件次</span>`);
+  }
+  if (isTimedMode) {
+    const dVal = alt.totalValue - base.totalValue;
+    if (dVal === 0) {
+      spans.push('<span class="delta-flat">可选价值与最优相同</span>');
+    } else {
+      spans.push(`<span class="delta-down">可选价值少 ${-dVal}</span>`);
+    }
+  }
+  return spans;
+}
+
+/** 方案概要条：共找到几条、排序规则说明。 */
+function alternativesOverviewBlock(data) {
+  const wrap = document.createElement('div');
+  wrap.className = 'alt-overview';
+  const total = data.alternatives.length;
+  const rule = data.mode === 'timed'
+    ? '排序规则：可选场景价值降序 → 道具操作总数升序；完全同分时按场景录入顺序。'
+    : '排序规则：道具操作总数升序；完全同分时按场景录入顺序。';
+  wrap.innerHTML =
+    `<h3>📋 备选节目单（共 ${total} 条顺序不同的可行编排）</h3>`
+    + `<p class="hint">下方方案 1 为最优方案（即当前节目单）；其余为满足全部约束与单段上限的备选。`
+    + `${rule} 选中任一方案即可按该顺序进入演出中重排。</p>`;
+  return wrap;
+}
+
+function compactChipLine(title, ids, cls) {
+  const div = document.createElement('div');
+  div.className = 'alt-chip-line';
+  const lab = document.createElement('span');
+  lab.className = 'replan-change-label';
+  lab.textContent = title;
+  div.appendChild(lab);
+  if (!ids.length) {
+    const none = document.createElement('span');
+    none.className = 'hint';
+    none.textContent = '无';
+    div.appendChild(none);
+  } else {
+    ids.forEach(id => {
+      const c = document.createElement('span');
+      c.className = 'change-chip ' + (cls || '');
+      c.textContent = sceneName(id);
+      div.appendChild(c);
+    });
+  }
+  return div;
+}
+
+/** 备选列表：方案 2..K（方案 1 已在上方主结果区完整展示）。 */
+function alternativesListBlock(data) {
+  const wrap = document.createElement('div');
+  wrap.className = 'alt-list';
+  const base = data.alternatives[0];
+
+  for (const alt of data.alternatives) {
+    if (alt.rank === 1) continue;
+    const card = document.createElement('div');
+    card.className = 'alt-card';
+
+    const head = document.createElement('div');
+    head.className = 'alt-card-head';
+    const title = document.createElement('span');
+    title.className = 'alt-card-title';
+    title.innerHTML = `方案 ${alt.rank} <span class="hint">（对比方案 1）</span>`;
+    head.appendChild(title);
+
+    const adopt = document.createElement('button');
+    adopt.className = 'btn btn-sm btn-primary';
+    adopt.textContent = '✓ 采用此方案进入演出';
+    adopt.addEventListener('click', () => adoptAlternative(data, alt));
+    head.appendChild(adopt);
+    card.appendChild(head);
+
+    // 指标与取舍
+    const metrics = document.createElement('div');
+    metrics.className = 'alt-metrics';
+    const parts = [];
+    parts.push(`<span>道具增减：<strong>${alt.totalCost}</strong> 次</span>`);
+    if (data.opLimit) {
+      const maxUsed = alt.steps.reduce((m, s) => Math.max(m, s.count), 0);
+      parts.push(`<span class="cap-cap">最大单段 ${maxUsed}/${data.opLimit} 件</span>`);
+    }
+    if (data.mode === 'timed') {
+      parts.push(`<span>入选价值：<strong>${alt.totalValue}</strong></span>`);
+      parts.push(`<span>时长：<strong>${alt.usedDuration}</strong>/${alt.timeLimit} 分钟（余 ${alt.remainingDuration}）</span>`);
+    }
+    parts.push(...tradeoffSpans(base, alt, data.mode === 'timed'));
+    metrics.innerHTML = parts.join('');
+    card.appendChild(metrics);
+
+    // 顺序
+    card.appendChild(flowBlock(alt.order, 0));
+
+    // timed：入选 / 舍弃差异
+    if (data.mode === 'timed') {
+      const baseSet = new Set(base.selectedIds);
+      const altSet = new Set(alt.selectedIds);
+      const dropped = base.selectedIds.filter(id => !altSet.has(id));
+      const added = alt.selectedIds.filter(id => !baseSet.has(id));
+      if (dropped.length || added.length) {
+        const changes = document.createElement('div');
+        changes.className = 'alt-changes';
+        changes.appendChild(compactChipLine('相对方案 1 舍弃：', dropped, 'change-drop'));
+        changes.appendChild(compactChipLine('相对方案 1 新增：', added, 'change-add'));
+        card.appendChild(changes);
+      }
+    }
+
+    // 换景明细（可折叠）
+    const det = document.createElement('details');
+    det.className = 'alt-details';
+    const sum = document.createElement('summary');
+    sum.textContent = `换景明细（${alt.steps.length} 段）`;
+    det.appendChild(sum);
+    det.appendChild(stepsBlock(alt));
+    card.appendChild(det);
+
+    wrap.appendChild(card);
+  }
+  return wrap;
+}
+
+/**
+ * 采用一条备选：以它的顺序替换当前节目单（顶层 live），随后可按该顺序
+ * 进入现有演出中重排流程。采纳后不再保留其余备选展示。
+ * 备选条目只含方案自身字段（rank 等），需与顶层响应的公共字段（ok / mode…）合并。
+ */
+function adoptAlternative(data, alt) {
+  const adopted = { ...data, ...alt };
+  delete adopted.rank;
+  delete adopted.alternatives;
+  state.live = adopted;
+  state.replan = null;
+  renderResult(adopted);
+  showStatus(`已采用方案 ${alt.rank}：后续可在「🎬 演出中重排」中确认已完成前缀并按此顺序继续演出`);
 }
 
 function escapeHtml(s) {
@@ -971,6 +1139,8 @@ async function deletePlan() {
 function newPlan() {
   state.planId = null;
   state.opLimit = null;
+  state.alternatives = 1;
+  $('#alt-count').value = '1';
   state.scenes = [];
   state.constraints = { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] };
   state.live = null;
@@ -1064,6 +1234,11 @@ $('#op-limit').addEventListener('input', () => {
   const v = Math.max(1, Math.floor(Number($('#op-limit').value) || 0));
   state.opLimit = v;
   $('#op-limit-hint').textContent = `每段撤下 + 上台合计不得超过 ${v} 件；求解器将在满足该上限的候选中按原目标选最优顺序。`;
+});
+
+$('#alt-count').addEventListener('change', () => {
+  const v = Number($('#alt-count').value);
+  state.alternatives = (v >= 2 && v <= 3) ? v : 1;
 });
 
 $('#btn-add-dep').addEventListener('click', () => {

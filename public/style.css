@@ -371,3 +371,84 @@ input[type="number"] { width: 70px; }
 .phase-suffix { background: #4a3a6b; color: #d9c9f5; border: 1px solid var(--accent-2); }
 .step-done { opacity: 0.62; }
 .step-done .step-title { text-decoration: line-through; text-decoration-color: rgba(255,255,255,0.35); }
+
+/* ================= 备选节目单 ================= */
+.alt-count-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--muted);
+}
+#alt-count { width: auto; }
+
+.alt-overview {
+  border: 1px solid var(--accent);
+  background: rgba(232, 182, 76, 0.07);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin: 4px 0 16px;
+}
+.alt-overview h3 { margin: 0 0 6px; font-size: 16px; }
+.alt-overview p { margin: 0; }
+
+.alt-primary-badge {
+  display: inline-block;
+  font-size: 14px;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  background: rgba(232, 182, 76, 0.1);
+  border-radius: 6px;
+  padding: 4px 12px;
+  margin: 2px 0 10px;
+}
+.alt-primary-badge strong { font-size: 15px; }
+
+.alt-list { display: flex; flex-direction: column; gap: 14px; margin: 16px 0 8px; }
+.alt-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-2);
+  background: var(--card-2);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+.alt-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.alt-card-title { font-weight: bold; font-size: 15px; }
+.alt-metrics {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 6px 0 4px;
+}
+.alt-metrics strong { color: var(--accent); }
+.alt-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 4px;
+}
+.alt-chip-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 13px; }
+.alt-details {
+  margin-top: 8px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.alt-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13.5px;
+  user-select: none;
+}
+.alt-details[open] summary { margin-bottom: 8px; }

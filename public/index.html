@@ -110,6 +110,13 @@
       </div>
       <div class="toolbar">
         <button id="btn-solve" class="btn btn-primary">▶ 计算最优顺序</button>
+        <label class="alt-count-field">备选节目单
+          <select id="alt-count" title="一次最多请求 3 条顺序不同的可行编排；选 1 时只返回最优的一条">
+            <option value="1">仅最优 1 条</option>
+            <option value="2">2 条</option>
+            <option value="3">3 条</option>
+          </select>
+        </label>
         <input type="text" id="plan-name" placeholder="方案名称">
         <button id="btn-save" class="btn">💾 保存方案</button>
         <button id="btn-new" class="btn btn-ghost">新建方案</button>

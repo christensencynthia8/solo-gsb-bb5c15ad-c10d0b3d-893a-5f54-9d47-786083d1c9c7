@@ -34,6 +34,8 @@
  */
 
 const MAX_SCENES = 12;
+/** /api/solve 一次最多可请求的备选节目单条数（含最优方案本身）。 */
+const MAX_ALTERNATIVES = 3;
 
 function normalizeProps(props) {
   const out = [];
@@ -347,6 +349,248 @@ function runTimedDP(model, timeLimit, opLimit = Infinity) {
   }
   orderIdx.reverse();
   return { cost: best.cost, orderIdx, value: best.value, usedDuration: best.usedDuration, mask: best.mask };
+}
+
+/* ============================================================
+ * 备选节目单（k-best）
+ * ============================================================
+ *
+ * 用户可一次请求最多 MAX_ALTERNATIVES 条顺序互不相同的可行编排。
+ * 与单解 DP 不同，这里每个 (集合, 末尾) 状态保留至多 K 条互不相同的
+ * 最优路径（K-best on a DAG / 子集格），因此不会因某个中间状态只留下
+ * 一条最优路径而丢掉次优但同样可行的完整编排。
+ *
+ * 排序规则：
+ *  - classic：总操作数（开场布置 + 各次换景）升序；
+ *  - timed：① 入选可选场景价值降序 → ② 总操作数升序；
+ *  - 完全同分：按"场景下标序列字典序"稳定排序（等价于按场景录入顺序，
+ *    第一个出现分歧的位置取录入更靠前的场景）。
+ *
+ * 单段上限 opLimit 与依赖 / 固定序位 / 禁止相邻在每条边上逐段校验，
+ * 因此返回的每一条备选都满足全部约束。
+ */
+
+/** 规范化备选条数：接受 1..MAX_ALTERNATIVES 的整数，其余视为不请求（1）。 */
+function normAlternatives(v) {
+  const n = Number(v);
+  return (Number.isFinite(n) && Number.isInteger(n) && n >= 1 && n <= MAX_ALTERNATIVES) ? n : 1;
+}
+
+/** 两个下标序列按字典序比较：a < b 返回 -1，a > b 返回 1，完全相同返回 0。 */
+function lexCompare(a, b) {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : (a.length < b.length ? -1 : 1);
+}
+
+/** 同状态桶的排序键：代价升序 → 路径字典序升序。返回 sort 比较器语义（-1/0/1）。 */
+function entryCompare(x, y) {
+  if (x.cost !== y.cost) return x.cost < y.cost ? -1 : 1;
+  return lexCompare(x.path, y.path);
+}
+
+/**
+ * 对状态桶就地排序、按路径去重并截断到至多 K 条。
+ * 状态 dp[mask] 只在"向更大集合的转移开始前"剪枝（读桶前），
+ * 此时对 dp[mask] 的全部写入均已完成，故按每状态保留 K 条不会漏解。
+ */
+function pruneBucket(bucket, K) {
+  if (bucket.length <= 1) return;
+  bucket.sort(entryCompare);
+  let w = 0;
+  for (let i = 0; i < bucket.length; i++) {
+    if (w > 0 && lexCompare(bucket[i].path, bucket[w - 1].path) === 0) continue;
+    bucket[w++] = bucket[i];
+    if (w === K) break;
+  }
+  bucket.length = w;
+}
+
+/**
+ * classic k-best：状态 (已排集合, 末尾场景) 各保留至多 K 条最优路径。
+ * 返回按（代价升序、路径字典序升序）排列的至多 K 条完整编排，每条为
+ * { cost, path: [全局场景下标...] }；无解返回空数组。
+ */
+function runDPKBest(model, opLimit = Infinity, K = MAX_ALTERNATIVES) {
+  const { n, prereq, fixedPosOfScene, sceneAtPos, bad, cost, setupCost } = model;
+  const fullMask = (1 << n) - 1;
+
+  const allowedAt = (j, pos) =>
+    (fixedPosOfScene[j] === -1 || fixedPosOfScene[j] === pos) &&
+    (sceneAtPos[pos] === -1 || sceneAtPos[pos] === j);
+
+  // dp[mask][last]：该状态的路径桶（惰性创建）
+  const dp = new Array(1 << n);
+  const ensure = (m, last) => {
+    if (!dp[m]) dp[m] = Array.from({ length: n }, () => null);
+    if (!dp[m][last]) dp[m][last] = [];
+    return dp[m][last];
+  };
+
+  for (let j = 0; j < n; j++) {
+    if (prereq[j] !== 0) continue;
+    if (!allowedAt(j, 0)) continue;
+    if (setupCost[j] > opLimit) continue;
+    ensure(1 << j, j).push({ cost: setupCost[j], path: [j] });
+  }
+
+  for (let mask = 1; mask <= fullMask; mask++) {
+    const layer = dp[mask];
+    if (!layer) continue;
+    const pos = popcount(mask); // 追加场景所在序位（0 起）
+    if (pos >= n) continue;
+    for (let last = 0; last < n; last++) {
+      const bucket = layer[last];
+      if (!bucket) continue;
+      pruneBucket(bucket, K); // 即将作为前驱被读取：剪枝
+      for (const entry of bucket) {
+        for (let j = 0; j < n; j++) {
+          const bit = 1 << j;
+          if (mask & bit) continue;
+          if ((prereq[j] & ~mask) !== 0) continue;
+          if (!allowedAt(j, pos)) continue;
+          if (bad[last][j]) continue;
+          if (cost[last][j] > opLimit) continue;
+          ensure(mask | bit, j).push({ cost: entry.cost + cost[last][j], path: entry.path.concat(j) });
+        }
+      }
+    }
+  }
+
+  const full = dp[fullMask];
+  if (!full) return [];
+  const all = [];
+  for (let last = 0; last < n; last++) {
+    const bucket = full[last];
+    if (bucket) for (const e of bucket) all.push(e);
+  }
+  pruneBucket(all, K);
+  return all;
+}
+
+/**
+ * timed k-best：全局子集 DP，每个 (入选集合, 末尾场景) 状态保留至多 K 条
+ * 最优排列路径。最终在全部"含必演、不超时"的候选路径中，按
+ * （价值降序、代价升序、路径字典序升序）取至多 K 条；不同备选允许
+ * 入选不同的场景子集。无必演时空节目单恒为一条可行备选。
+ */
+function runTimedDPKBest(model, timeLimit, opLimit = Infinity, K = MAX_ALTERNATIVES) {
+  const { n, prereq, fixedMask, bad, cost, setupCost, durations, values, requiredMask } = model;
+  const fullMask = (1 << n) - 1;
+
+  const fixedAt = (j, p) => {
+    const fm = fixedMask[j];
+    return fm === 0 || fm === (1 << p);
+  };
+
+  // succMask[a]：必须排在 a 之后的场景集合
+  const succMask = new Array(n).fill(0);
+  for (let b = 0; b < n; b++) {
+    let m = prereq[b];
+    while (m) {
+      const bit = m & -m;
+      const a = 31 - Math.clz32(bit);
+      succMask[a] |= (1 << b);
+      m ^= bit;
+    }
+  }
+
+  const durSum = new Float64Array(1 << n);
+  const valSum = new Float64Array(1 << n);
+  for (let m = 1; m <= fullMask; m++) {
+    const bit = m & -m;
+    const i = 31 - Math.clz32(bit);
+    const pm = m ^ bit;
+    durSum[m] = durSum[pm] + durations[i];
+    valSum[m] = valSum[pm] + values[i];
+  }
+
+  const dp = new Array(1 << n);
+  const ensure = (m, last) => {
+    if (!dp[m]) dp[m] = Array.from({ length: n }, () => null);
+    if (!dp[m][last]) dp[m][last] = [];
+    return dp[m][last];
+  };
+
+  for (let j = 0; j < n; j++) {
+    if (!fixedAt(j, 0)) continue;
+    if (setupCost[j] > opLimit) continue;
+    ensure(1 << j, j).push({ cost: setupCost[j], path: [j] });
+  }
+
+  for (let mask = 1; mask <= fullMask; mask++) {
+    const layer = dp[mask];
+    if (!layer) continue;
+    const posAfter = popcount(mask);
+    for (let last = 0; last < n; last++) {
+      const bit = 1 << last;
+      if (mask & bit) continue;
+      const nm = mask | bit;
+      if (!fixedAt(last, posAfter)) continue;
+      if (succMask[last] & mask) continue;
+      // (nm,last) 的前驱集合唯一（nm\\{last} = mask），本轮结束后该桶写入完毕
+      let w = null;
+      for (let prev = 0; prev < n; prev++) {
+        const bucket = layer[prev];
+        if (!bucket) continue;
+        pruneBucket(bucket, K); // 作为前驱读取前剪枝
+        if (bad[prev][last]) continue;
+        if (cost[prev][last] > opLimit) continue;
+        if (!w) w = ensure(nm, last);
+        for (const e of bucket) {
+          w.push({ cost: e.cost + cost[prev][last], path: e.path.concat(last) });
+        }
+      }
+      if (w) pruneBucket(w, K);
+    }
+  }
+
+  // 全局择优：价值降序 → 代价升序 → 路径字典序升序，在线维护至多 K 条
+  const better = (x, y) =>
+    x.value > y.value
+    || (x.value === y.value && (x.cost < y.cost
+      || (x.cost === y.cost && lexCompare(x.path, y.path) < 0)));
+
+  const winners = []; // [{ cost, path, value, usedDuration, mask }]
+  const consider = (entry, mask) => {
+    const cand = {
+      cost: entry.cost, path: entry.path, value: valSum[mask],
+      usedDuration: durSum[mask], mask,
+    };
+    if (winners.length < K || better(cand, winners[winners.length - 1])) {
+      winners.push(cand);
+      let i = winners.length - 1;
+      while (i > 0 && better(winners[i], winners[i - 1])) {
+        [winners[i - 1], winners[i]] = [winners[i], winners[i - 1]];
+        i--;
+      }
+      if (winners.length > K) winners.pop();
+    }
+  };
+
+  // 无必演项：空节目单（价值 0、代价 0）恒为可行备选
+  if (requiredMask === 0) {
+    consider({ cost: 0, path: [] }, 0);
+  }
+
+  for (let mask = 0; mask <= fullMask; mask++) {
+    if (mask === 0) continue;
+    if ((mask & requiredMask) !== requiredMask) continue;
+    if (durSum[mask] > timeLimit) continue;
+    const layer = dp[mask];
+    if (!layer) continue;
+    for (let last = 0; last < n; last++) {
+      const bucket = layer[last];
+      if (!bucket) continue;
+      pruneBucket(bucket, K);
+      // 同 (mask,last) 内可有"同价值、同代价但顺序不同"的多条路径，
+      // 它们都可能进入备选（同分按路径字典序稳定排序），须全部参选。
+      for (const e of bucket) consider(e, mask);
+    }
+  }
+  return winners;
 }
 
 /** 检测依赖环，返回构成环的依赖约束数组，无环返回 null。 */
@@ -1724,11 +1968,16 @@ function buildPropLimitConflict(opLimit, minCap, timed, suffix) {
 
 /**
  * 求解入口。
- * @param {object} options { mode?: 'classic'|'timed', timeLimit?: number, opLimit?: number }
- *   opLimit 为可选的单段道具操作上限（正整数；缺省表示不限）
+ * @param {object} options { mode?: 'classic'|'timed', timeLimit?: number,
+ *   opLimit?: number, alternatives?: number }
+ *   opLimit 为可选的单段道具操作上限（正整数；缺省表示不限）。
+ *   alternatives 为 1..MAX_ALTERNATIVES 的整数：为 1（或缺省）时完全保持
+ *   原有单条响应；>=2 时额外返回 alternatives 数组，含至多该数量条
+ *   互不相同、已按规则排序的可行节目单（第 1 条即原有最优解）。
  * @returns 经典有解：{ ok:true, order, totalCost, opLimit, steps }
  *          时长受限有解：{ ok:true, mode:'timed', order, selectedIds, excludedIds,
  *                          totalCost, totalValue, usedDuration, remainingDuration, timeLimit, opLimit, steps }
+ *          请求备选时以上字段仍在顶层（描述第 1 条方案），并额外带 alternatives。
  *          无解：{ ok:false, conflict }（时长超限额外带 reason:'required-overtime'；
  *                上限导致无解时 conflict.type 为 'prop-limit-infeasible' 并带 minRequiredLimit）
  */
@@ -1736,8 +1985,36 @@ function solve(scenes, constraints, options = {}) {
   const model = buildModel(scenes, constraints);
   const opLimit = normOpLimit(options.opLimit);
   const opLimitOut = opLimit === Infinity ? null : opLimit;
+  const altCount = normAlternatives(options.alternatives);
 
   if (options.mode !== 'timed') {
+    if (altCount > 1) {
+      const entries = runDPKBest(model, opLimit, altCount);
+      if (!entries.length) {
+        if (opLimit !== Infinity && runDP(model) !== null) {
+          const minCap = minCapByBinarySearch(mainMaxEdge(model), l => runDP(model, l) !== null);
+          return { ok: false, conflict: buildPropLimitConflict(opLimit, minCap, false, false) };
+        }
+        return { ok: false, conflict: analyzeConflict(scenes, constraints || {}) };
+      }
+      const alternatives = entries.map(e => ({
+        rank: 0,
+        order: e.path.map(i => scenes[i].id),
+        totalCost: e.cost,
+        opLimit: opLimitOut,
+        steps: buildSteps(model, scenes, e.path),
+      }));
+      alternatives.forEach((a, i) => { a.rank = i + 1; });
+      return {
+        ok: true,
+        order: alternatives[0].order,
+        totalCost: alternatives[0].totalCost,
+        opLimit: opLimitOut,
+        steps: alternatives[0].steps,
+        alternatives,
+      };
+    }
+
     const res = runDP(model, opLimit);
     if (!res) {
       if (opLimit !== Infinity && runDP(model) !== null) {
@@ -1777,6 +2054,55 @@ function solve(scenes, constraints, options = {}) {
   }
 
   const res = runTimedDP(model, timeLimit, opLimit);
+
+  /** 把一条 timed k-best 路径组装成与单解响应同构的方案对象。 */
+  const buildTimedAlternative = (entry, rank) => {
+    const selectedIds = entry.path.map(i => scenes[i].id);
+    const selectedSet = new Set(selectedIds);
+    const excludedIds = scenes.map(s => s.id).filter(id => !selectedSet.has(id));
+    return {
+      rank,
+      order: selectedIds,
+      selectedIds,
+      excludedIds,
+      totalCost: entry.cost,
+      opLimit: opLimitOut,
+      totalValue: entry.value,
+      usedDuration: entry.usedDuration,
+      remainingDuration: timeLimit - entry.usedDuration,
+      timeLimit,
+      steps: buildSteps(model, scenes, entry.path),
+    };
+  };
+
+  if (altCount > 1) {
+    const entries = runTimedDPKBest(model, timeLimit, opLimit, altCount);
+    if (!entries.length) {
+      if (opLimit !== Infinity && runTimedDP(model, timeLimit) !== null) {
+        const minCap = minCapByBinarySearch(mainMaxEdge(model), l => runTimedDP(model, timeLimit, l) !== null);
+        return { ok: false, conflict: buildPropLimitConflict(opLimit, minCap, true, false) };
+      }
+      return { ok: false, conflict: analyzeTimedInfeasible(scenes, constraints || {}, model, timeLimit) };
+    }
+    const alternatives = entries.map((e, i) => buildTimedAlternative(e, i + 1));
+    const first = alternatives[0];
+    return {
+      ok: true,
+      mode: 'timed',
+      order: first.order,
+      selectedIds: first.selectedIds,
+      excludedIds: first.excludedIds,
+      totalCost: first.totalCost,
+      totalValue: first.totalValue,
+      usedDuration: first.usedDuration,
+      remainingDuration: first.remainingDuration,
+      timeLimit,
+      opLimit: opLimitOut,
+      steps: first.steps,
+      alternatives,
+    };
+  }
+
   if (!res) {
     if (opLimit !== Infinity && runTimedDP(model, timeLimit) !== null) {
       const minCap = minCapByBinarySearch(mainMaxEdge(model), l => runTimedDP(model, timeLimit, l) !== null);
@@ -1805,4 +2131,4 @@ function solve(scenes, constraints, options = {}) {
   };
 }
 
-module.exports = { solve, replan, MAX_SCENES, normalizeProps };
+module.exports = { solve, replan, MAX_SCENES, MAX_ALTERNATIVES, normalizeProps };
